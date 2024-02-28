@@ -36,7 +36,6 @@
 //      - <lhs>__VforceRd = <lhs> // iff lhs is a net
 //
 //*************************************************************************
-
 #include "V3PchAstNoMT.h"  // VL_MT_DISABLED_CODE_UNIT
 
 #include "V3Force.h"
@@ -52,15 +51,17 @@ class ForceConvertVisitor final : public VNVisitor {
     // TYPES
     struct ForceComponentsVar final {
         AstVar* const m_rdVarp;  // New variable to replace read references with
-        AstVar* const m_valVarp;  // Forced value
+        AstVar* const m_valVarp; // Forced value
         AstVar* const m_enVarp;  // Force enabled signal
+
         explicit ForceComponentsVar(AstVar* varp)
             : m_rdVarp{new AstVar{varp->fileline(), VVarType::WIRE, varp->name() + "__VforceRd",
                                   varp->dtypep()}}
             , m_valVarp{new AstVar{varp->fileline(), VVarType::VAR, varp->name() + "__VforceVal",
                                    varp->dtypep()}}
             , m_enVarp{new AstVar{varp->fileline(), VVarType::VAR, varp->name() + "__VforceEn",
-                                  (isRangedDType(varp) ? varp->dtypep() : varp->findBitDType())}} {
+                                  ( (isRangedDType(varp) ||  VN_IS(varp->dtypeSkipRefp(), UnpackArrayDType)) ? varp->dtypep() : varp->findBitDType())}} {
+                                    // i would say that the problem is this checdk more so than anything
             m_rdVarp->addNext(m_enVarp);
             m_rdVarp->addNext(m_valVarp);
             varp->addNextHere(m_rdVarp);
@@ -89,44 +90,105 @@ class ForceConvertVisitor final : public VNVisitor {
             vscp->addNextHere(m_rdVscp);
 
             FileLine* const flp = vscp->fileline();
-
+            // TODO init properly for unpacked case
             {  // Add initialization of the enable signal
                 AstVarRef* const lhsp = new AstVarRef{flp, m_enVscp, VAccess::WRITE};
                 V3Number zero{m_enVscp, m_enVscp->width()};
                 zero.setAllBits0();
                 AstNodeExpr* const rhsp = new AstConst{flp, zero};
-                AstAssign* const assignp = new AstAssign{flp, lhsp, rhsp};
+
+                AstAssign* assignp;
+                if(VN_IS(vscp->varp()->dtypeSkipRefp(), UnpackArrayDType)) {
+                  assignp = new AstAssign{flp, new AstArraySel{flp, lhsp, 0}, rhsp->cloneTreePure(false)};
+                  for(int idx = 1; idx<VN_CAST(m_enVscp->varp()->dtypeSkipRefp(), UnpackArrayDType)->elementsConst(); idx++) {
+                    assignp->addNext(
+                        new AstAssign{flp, new AstArraySel{flp, lhsp->cloneTreePure(false), idx}, rhsp->cloneTreePure(false)}
+                        );
+                  }
+                } else {
+                  assignp = new AstAssign{flp, lhsp, rhsp};
+                }
+
                 AstActive* const activep = new AstActive{
                     flp, "force-init",
                     new AstSenTree{flp, new AstSenItem{flp, AstSenItem::Initial{}}}};
+
                 activep->sensesStorep(activep->sensesp());
                 activep->addStmtsp(new AstInitial{flp, assignp});
                 vscp->scopep()->addBlocksp(activep);
             }
-
             {  // Add the combinational override
                 AstVarRef* const lhsp = new AstVarRef{flp, m_rdVscp, VAccess::WRITE};
                 AstVarRef* const origp = new AstVarRef{flp, vscp, VAccess::READ};
                 origp->user2(1);  // Don't replace this read ref with the read signal
-                AstNodeExpr* rhsp;
-                if (isRangedDType(vscp)) {
-                    rhsp = new AstOr{
+                std::vector<AstNodeExpr*> rhsp_vec;
+
+                if(VN_IS(vscp->varp()->dtypeSkipRefp(), UnpackArrayDType)) {
+                    v3info("into unpacked area");
+                    for(int idx = 0; idx < VN_CAST(m_enVscp->varp()->dtypeSkipRefp(), UnpackArrayDType)->elementsConst(); idx++) {
+                      if(isRangedDType(vscp)) {
+                        rhsp_vec.push_back(new AstOr{
+                            flp,
+                            new AstAnd{flp,
+                              new AstArraySel{flp, new AstVarRef{flp, m_enVscp, VAccess::READ}, idx},
+                              new AstArraySel{flp, new AstVarRef{flp, m_valVscp, VAccess::READ}, idx}
+                              },
+                            new AstAnd{flp,
+                              new AstNot{flp, new AstArraySel{flp, new AstVarRef{flp, m_enVscp, VAccess::READ}, idx}},
+                              new AstArraySel{flp, new AstVarRef{flp, vscp, VAccess::READ}, idx}
+                              }
+                            });
+                      } else {
+                        rhsp_vec.push_back(new AstCond{
+                          flp,                                                 // file line
+                          new AstArraySel{flp, new AstVarRef{flp, m_enVscp , VAccess::READ}, idx},// condp
+                          new AstArraySel{flp, new AstVarRef{flp, m_valVscp, VAccess::READ}, idx},// thenp
+                          new AstArraySel{flp, new AstVarRef{flp, vscp,      VAccess::READ}, idx} // elsep
+                        });
+                      }
+                    }
+                } else if (isRangedDType(vscp)) {
+                    rhsp_vec.push_back(new AstOr{
                         flp,
                         new AstAnd{flp, new AstVarRef{flp, m_enVscp, VAccess::READ},
-                                   new AstVarRef{flp, m_valVscp, VAccess::READ}},
-                        new AstAnd{flp,
-                                   new AstNot{flp, new AstVarRef{flp, m_enVscp, VAccess::READ}},
-                                   origp}};
+                        new AstVarRef{flp, m_valVscp, VAccess::READ}},
+                        new AstAnd{flp, new AstNot{flp, new AstVarRef{flp, m_enVscp, VAccess::READ}}, origp}
+                        });
                 } else {
-                    rhsp = new AstCond{flp, new AstVarRef{flp, m_enVscp, VAccess::READ},
-                                       new AstVarRef{flp, m_valVscp, VAccess::READ}, origp};
+                  rhsp_vec.push_back(new AstCond{
+                      flp,
+                      new AstVarRef{flp, m_enVscp , VAccess::READ},
+                      new AstVarRef{flp, m_valVscp, VAccess::READ},
+                      new AstVarRef{flp, vscp,      VAccess::READ}
+                  });
                 }
 
                 AstActive* const activep
                     = new AstActive{flp, "force-comb",
                                     new AstSenTree{flp, new AstSenItem{flp, AstSenItem::Combo{}}}};
+
                 activep->sensesStorep(activep->sensesp());
-                activep->addStmtsp(new AstAssignW{flp, lhsp, rhsp});
+
+                // TODO need to account for case in which unpack array is of ranged type
+                // TODO have generic function that iterates over 
+                // TODO example_1_test is failing, why?
+                if(VN_IS(vscp->varp()->dtypeSkipRefp(), UnpackArrayDType)) {
+                  AstAssignW* const astAssignWp = new AstAssignW{flp, new AstArraySel{flp, new AstVarRef{flp, vscp, VAccess::WRITE}, 0}, rhsp_vec[0]};
+                  for(int idx=1; idx < rhsp_vec.size(); idx++) {
+                    astAssignWp->addNext(
+                        new AstAssignW{
+                          flp,
+                          new AstArraySel{flp, new AstVarRef{flp, vscp, VAccess::WRITE}, idx},
+                          rhsp_vec[idx]
+                          });
+                  }
+                  activep->addStmtsp(astAssignWp);
+                } else {
+                  v3info("new else");
+                  AstAssignW* const astAssignWp = new AstAssignW{flp, new AstVarRef{flp, vscp, VAccess::WRITE}, rhsp_vec[0]};
+                  activep->addStmtsp(astAssignWp);
+                }
+                //activep->addStmtsp(astAssignWInitialp);
                 vscp->scopep()->addBlocksp(activep);
             }
         }
@@ -171,6 +233,7 @@ class ForceConvertVisitor final : public VNVisitor {
     // VISIT methods
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
 
+
     void visit(AstAssignForce* nodep) override {
         // The AstAssignForce node will be removed for sure
         VNRelinker relinker;
@@ -180,7 +243,6 @@ class ForceConvertVisitor final : public VNVisitor {
         FileLine* const flp = nodep->fileline();
         AstNodeExpr* const lhsp = nodep->lhsp();  // The LValue we are forcing
         AstNodeExpr* const rhsp = nodep->rhsp();  // The value we are forcing it to
-
         // Set corresponding enable signals to ones
         V3Number ones{lhsp, isRangedDType(lhsp) ? lhsp->width() : 1};
         ones.setAllBits1();
@@ -207,6 +269,7 @@ class ForceConvertVisitor final : public VNVisitor {
         relinker.relink(setEnp);
     }
 
+    // TODO when an index is specified for release there is a problem
     void visit(AstRelease* nodep) override {
         // The AstRelease node will be removed for sure
         VNRelinker relinker;
@@ -219,11 +282,40 @@ class ForceConvertVisitor final : public VNVisitor {
         // Set corresponding enable signals to zero
         V3Number zero{lhsp, isRangedDType(lhsp) ? lhsp->width() : 1};
         zero.setAllBits0();
-        AstAssign* const resetEnp
-            = new AstAssign{flp, lhsp->cloneTreePure(false), new AstConst{lhsp->fileline(), zero}};
-        transformWritenVarScopes(resetEnp->lhsp(), [this](AstVarScope* vscp) {
-            return getForceComponents(vscp).m_enVscp;
-        });
+
+        int is_unpacked  = VN_IS(nodep->lhsp()->dtypep()->dtypep()->skipRefp(), UnpackArrayDType);
+        int num_elements_unpacked;
+        if(is_unpacked) {
+          num_elements_unpacked = VN_CAST(nodep->lhsp()->dtypep()->skipRefp(), UnpackArrayDType)->elementsConst();
+        }
+        // ----------------------------
+        // -<lhs>_VforceEn = 0
+        AstAssign* resetEnp;
+        if(is_unpacked) { // need thi
+          resetEnp = new AstAssign{
+              flp,
+              new AstArraySel{flp, lhsp->cloneTreePure(false), 0},
+              new AstConst{lhsp->fileline(), zero}
+            };
+          for(int idx=1; idx < num_elements_unpacked; idx++) {
+            resetEnp->addNext(new AstAssign{
+                flp,
+                new AstArraySel{flp, lhsp->cloneTreePure(false), idx},
+                new AstConst{lhsp->fileline(), zero}
+              });
+          }
+        } else {
+          resetEnp = new AstAssign{flp, lhsp->cloneTreePure(false), new AstConst{lhsp->fileline(), zero}};
+        }
+
+        for(AstAssign* astNode = resetEnp; astNode; astNode = VN_CAST(astNode->nextp(), Assign)) {
+          transformWritenVarScopes(astNode->lhsp(), [this](AstVarScope* vscp) {
+              return getForceComponents(vscp).m_enVscp;
+          });
+        }
+
+        // ----------------------------
+
         // IEEE 1800-2017 10.6.2: If this is a net, and not a variable, then reset the read
         // signal directly as well, in case something in the same process reads it later. Also, if
         // it is a variable, and not a net, set the original signal to the forced value, as it
@@ -231,31 +323,92 @@ class ForceConvertVisitor final : public VNVisitor {
         // a later eval. Luckily we can do all this in a single assignment.
         FileLine* const fl_nowarn = new FileLine{flp};
         fl_nowarn->warnOff(V3ErrorCode::BLKANDNBLK, true);
-        AstAssign* const resetRdp
-            = new AstAssign{fl_nowarn, lhsp->cloneTreePure(false), lhsp->unlinkFrBack()};
-        // Replace write refs on the LHS
-        resetRdp->lhsp()->foreach([this](AstNodeVarRef* refp) {
-            if (refp->access() != VAccess::WRITE) return;
-            AstVarScope* const vscp = refp->varScopep();
-            AstVarScope* const newVscp
-                = vscp->varp()->isContinuously() ? getForceComponents(vscp).m_rdVscp : vscp;
-            // Disable BLKANDNBLK for this reference
-            FileLine* const flp = new FileLine{refp->fileline()};
-            flp->warnOff(V3ErrorCode::BLKANDNBLK, true);
-            AstVarRef* const newpRefp = new AstVarRef{flp, newVscp, VAccess::WRITE};
-            refp->replaceWith(newpRefp);
-            VL_DO_DANGLING(refp->deleteTree(), refp);
-        });
-        // Replace write refs on RHS
-        resetRdp->rhsp()->foreach([this](AstNodeVarRef* refp) {
-            if (refp->access() != VAccess::WRITE) return;
+
+        std::vector<AstAssign*> resetRdp_vec;
+        AstNodeExpr* astNodeExprp = (VN_IS(lhsp->cloneTreePure(false), ArraySel)) ? VN_CAST(lhsp->unlinkFrBack(), ArraySel)->fromp()->cloneTreePure(false) : lhsp->unlinkFrBack();
+
+        // TODO need to switch between the lhsp ver of this
+        resetRdp_vec.push_back(new AstAssign{fl_nowarn, astNodeExprp->cloneTreePure(false), astNodeExprp->cloneTreePure(false)});
+        if(is_unpacked) {
+          for(int idx=1; idx<num_elements_unpacked; idx++) {
+            resetRdp_vec.push_back(new AstAssign{fl_nowarn, astNodeExprp->cloneTreePure(false), astNodeExprp->cloneTreePure(false)});
+          }
+        }
+
+        int array_sel = 0; // jmc| probably still needed for case of non array sel release (release entire var)
+        for (auto resetRdpIt=resetRdp_vec.begin(); resetRdpIt!=resetRdp_vec.end(); ++resetRdpIt, ++array_sel) {
+          AstAssign* resetRdp = *resetRdpIt;
+
+          AstNodeExpr* index;
+          if(AstArraySel* const arrselp = VN_CAST(lhsp->cloneTreePure(false), ArraySel)) { // this might have to be the case for ANY unpacked type
+            v3info("into the index");
+            index = arrselp->bitp();
+          } else {
+            v3info("into the const");
+            index = new AstConst(flp, array_sel); // new ast const as part of an ast expr
+          }
+
+          resetRdp->lhsp()->foreach([=, this](AstNodeVarRef* refp) {
+              if (refp->access() != VAccess::WRITE) return;
+              AstVarScope* const vscp = refp->varScopep();
+
+              // JMC| I think because each refp has isContinously evaluate to false, nothing ends up changed
+              AstVarScope* const newVscp
+                  = vscp->varp()->isContinuously() ? getForceComponents(vscp).m_rdVscp : vscp;
+
+              // Disable BLKANDNBLK for this reference
+              FileLine* const flp = new FileLine{refp->fileline()};
+              flp->warnOff(V3ErrorCode::BLKANDNBLK, true);
+
+              if(VN_IS(vscp->varp()->dtypeSkipRefp(), UnpackArrayDType)) {
+               AstArraySel* newpRefp =
+                  new AstArraySel{ flp, new AstVarRef{flp, newVscp, VAccess::WRITE }, index->cloneTreePure(false)};
+                refp->replaceWith(newpRefp);
+                VL_DO_DANGLING(refp->deleteTree(), refp);
+              } else {
+                AstVarRef* newpRefp =
+                  new AstVarRef{flp, newVscp, VAccess::WRITE};
+                refp->replaceWith(newpRefp);
+                VL_DO_DANGLING(refp->deleteTree(), refp);
+              }
+
+          });
+
+        // TODO jmc| maybe should change these to foreach loops and not foreach lambdas
+        resetRdp->rhsp()->foreach([=, this](AstNodeVarRef* refp) {
+            v3info("rhsp lambda iter");
+            if (refp->access() != VAccess::WRITE) {
+              v3info("early return form rhsp lambda");
+              return;
+            }
             AstVarScope* const vscp = refp->varScopep();
             FileLine* const flp = new FileLine{refp->fileline()};
             AstVarRef* const newpRefp = new AstVarRef{refp->fileline(), vscp, VAccess::READ};
             newpRefp->user2(1);  // Don't replace this read ref with the read signal
             if (vscp->varp()->isContinuously()) {
                 refp->replaceWith(newpRefp);
-            } else if (isRangedDType(vscp)) {
+            } else if(VN_IS(vscp->varp()->dtypeSkipRefp(), UnpackArrayDType)) {
+              if(isRangedDType(vscp)) {
+                refp->replaceWith(new AstOr{
+                    flp,
+                    new AstAnd{flp,
+                      new AstArraySel{flp, new AstVarRef{flp, getForceComponents(vscp).m_enVscp, VAccess::READ},  index->cloneTreePure(false)},
+                      new AstArraySel{flp, new AstVarRef{flp, getForceComponents(vscp).m_valVscp, VAccess::READ}, index->cloneTreePure(false)}
+                      },
+                    new AstAnd{flp,
+                      new AstNot{flp, new AstArraySel{flp, new AstVarRef{flp, getForceComponents(vscp).m_enVscp, VAccess::READ}, index->cloneTreePure(false)}},
+                      new AstArraySel{flp, newpRefp, index->cloneTreePure(false)}
+                      }
+                    });
+              } else {
+                refp->replaceWith(new AstCond{
+                    flp,
+                    new AstArraySel{flp, new AstVarRef{flp, getForceComponents(vscp).m_enVscp, VAccess::READ}, index->cloneTreePure(false)},
+                    new AstArraySel{flp, new AstVarRef{flp, getForceComponents(vscp).m_valVscp, VAccess::READ}, index->cloneTreePure(false)},
+                    new AstArraySel{flp, newpRefp, index->cloneTreePure(false)}
+                    });
+              }
+            }  else if (isRangedDType(vscp)) { // TODO this check might be problematic in the unpack array case, same as constructor for forceEn was
                 refp->replaceWith(new AstOr{
                     flp,
                     new AstAnd{
@@ -266,7 +419,7 @@ class ForceConvertVisitor final : public VNVisitor {
                         new AstNot{flp, new AstVarRef{flp, getForceComponents(vscp).m_enVscp,
                                                       VAccess::READ}},
                         newpRefp}});
-            } else {
+            }else {
                 refp->replaceWith(new AstCond{
                     flp, new AstVarRef{flp, getForceComponents(vscp).m_enVscp, VAccess::READ},
                     new AstVarRef{flp, getForceComponents(vscp).m_valVscp, VAccess::READ},
@@ -274,9 +427,12 @@ class ForceConvertVisitor final : public VNVisitor {
             }
             VL_DO_DANGLING(refp->deleteTree(), refp);
         });
+        }
 
-        resetRdp->addNext(resetEnp);
-        relinker.relink(resetRdp);
+        for(int idx = 1; idx < resetRdp_vec.size(); idx++)
+          resetRdp_vec[0]->addNext(resetRdp_vec[idx]);
+        resetRdp_vec[0]->addNext(resetEnp);
+        relinker.relink(resetRdp_vec[0]);
     }
 
     void visit(AstVarScope* nodep) override {
