@@ -269,7 +269,6 @@ class ForceConvertVisitor final : public VNVisitor {
         relinker.relink(setEnp);
     }
 
-    // TODO when an index is specified for release there is a problem
     void visit(AstRelease* nodep) override {
         // The AstRelease node will be removed for sure
         VNRelinker relinker;
@@ -288,8 +287,12 @@ class ForceConvertVisitor final : public VNVisitor {
         if(is_unpacked) {
           num_elements_unpacked = VN_CAST(nodep->lhsp()->dtypep()->skipRefp(), UnpackArrayDType)->elementsConst();
         }
+        v3info("is_unpacked          : " <<  is_unpacked);
+        v3info("num_elements_unpacked: " <<  num_elements_unpacked);
+
         // ----------------------------
         // -<lhs>_VforceEn = 0
+
         AstAssign* resetEnp;
         if(is_unpacked) { // need thi
           resetEnp = new AstAssign{
@@ -315,7 +318,6 @@ class ForceConvertVisitor final : public VNVisitor {
         }
 
         // ----------------------------
-
         // IEEE 1800-2017 10.6.2: If this is a net, and not a variable, then reset the read
         // signal directly as well, in case something in the same process reads it later. Also, if
         // it is a variable, and not a net, set the original signal to the forced value, as it
@@ -334,19 +336,24 @@ class ForceConvertVisitor final : public VNVisitor {
             resetRdp_vec.push_back(new AstAssign{fl_nowarn, astNodeExprp->cloneTreePure(false), astNodeExprp->cloneTreePure(false)});
           }
         }
+        v3info("resetRdp_vec.size: " << resetRdp_vec.size());
 
         int array_sel = 0; // jmc| probably still needed for case of non array sel release (release entire var)
-        for (auto resetRdpIt=resetRdp_vec.begin(); resetRdpIt!=resetRdp_vec.end(); ++resetRdpIt, ++array_sel) {
-          AstAssign* resetRdp = *resetRdpIt;
+        //for (auto resetRdpIt=resetRdp_vec.begin(); resetRdpIt!=resetRdp_vec.end(); ++resetRdpIt, ++array_sel) {
+        for(AstAssign* resetRdp : resetRdp_vec) {
+          v3info("iter: " << array_sel);
+          v3info("at least got past this - " << array_sel);
 
           AstNodeExpr* index;
-          if(AstArraySel* const arrselp = VN_CAST(lhsp->cloneTreePure(false), ArraySel)) { // this might have to be the case for ANY unpacked type
-            v3info("into the index");
-            index = arrselp->bitp();
+          if(AstArraySel* const arrselp = VN_CAST(lhsp, ArraySel)) {
+            v3info("into the index - " << array_sel);
+            index = arrselp->bitp()->cloneTreePure(false);
           } else {
-            v3info("into the const");
-            index = new AstConst(flp, array_sel); // new ast const as part of an ast expr
+            v3info("into the const - " << array_sel);
+            // make index the index corresponding to resetRdpIt as an array sel
+            index = new AstConst(flp, array_sel++); // new ast const as part of an ast expr
           }
+          v3info("what the fuck - " << array_sel); // jmc| v3info will only show exact same string once :(
 
           resetRdp->lhsp()->foreach([=, this](AstNodeVarRef* refp) {
               if (refp->access() != VAccess::WRITE) return;
